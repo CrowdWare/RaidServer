@@ -83,6 +83,9 @@ private fun parseDungeonBlocks(text: String): List<Block> {
 }
 
 private fun mapTileId(key: String): Int {
+    if (key == "S") {
+        return 8
+    }
     return when (key.lowercase()) {
         "s" -> 0
         "t" -> 1
