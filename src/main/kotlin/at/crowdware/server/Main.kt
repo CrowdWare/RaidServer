@@ -34,12 +34,26 @@ data class ChunkCoord(val x: Int, val y: Int, val z: Int)
 
 private const val CHUNK_SIZE = 32
 private const val DEFAULT_BLOCK_CM = 60
+private const val DEFAULT_WORLD_SEED = 0L
+private const val ENV_WORLD_SEED = "WORLD_SEED"
+private const val ENV_CHUNK_DEBUG = "CHUNK_DEBUG"
 private val logger = LoggerFactory.getLogger("RaidServer")
 
 private data class DungeonParseResult(
     val blocks: List<Block>,
     val chunkSize: Int?
 )
+
+private fun resolveWorldSeed(): Long {
+    val env = System.getenv(ENV_WORLD_SEED)?.trim().orEmpty()
+    if (env.isEmpty()) return DEFAULT_WORLD_SEED
+    return env.toLongOrNull() ?: DEFAULT_WORLD_SEED
+}
+
+private fun isDebugEnabled(envName: String): Boolean {
+    val value = System.getenv(envName)?.trim()?.lowercase().orEmpty()
+    return value == "1" || value == "true" || value == "yes" || value == "on"
+}
 
 private fun parseDungeonBlocks(text: String, warnOnMissingLines: Boolean = true): DungeonParseResult {
     val blocks = mutableListOf<Block>()
@@ -189,18 +203,23 @@ private fun parseChunkFileName(name: String): Triple<Int, Int, Int>? {
 private fun loadChunkedBlocks(folder: File, chunkSize: Int): List<Block> {
     val blocks = mutableListOf<Block>()
     if (!folder.exists()) return blocks
-    folder.listFiles { file -> file.isFile && file.name.startsWith("dungeon_") && file.name.endsWith(".sml") }
-        ?.forEach { file ->
-            val coords = parseChunkFileName(file.name) ?: return@forEach
-            val chunkText = file.readText()
-            val chunkParse = parseDungeonBlocks(chunkText, warnOnMissingLines = false)
-            val offsetX = coords.first * chunkSize
-            val offsetY = coords.second * chunkSize
-            val offsetZ = coords.third * chunkSize
-            chunkParse.blocks.forEach { blk ->
-                blocks.add(Block(blk.x + offsetX, blk.y + offsetY, blk.z + offsetZ, blk.key))
-            }
+    val chunkFiles = folder.listFiles { file ->
+        file.isFile && file.name.startsWith("dungeon_") && file.name.endsWith(".sml")
+    }?.mapNotNull { file ->
+        parseChunkFileName(file.name)?.let { coords -> coords to file }
+    }?.sortedWith(compareBy({ it.first.first }, { it.first.second }, { it.first.third }))
+        ?: emptyList()
+
+    chunkFiles.forEach { (coords, file) ->
+        val chunkText = file.readText()
+        val chunkParse = parseDungeonBlocks(chunkText, warnOnMissingLines = false)
+        val offsetX = coords.first * chunkSize
+        val offsetY = coords.second * chunkSize
+        val offsetZ = coords.third * chunkSize
+        chunkParse.blocks.forEach { blk ->
+            blocks.add(Block(blk.x + offsetX, blk.y + offsetY, blk.z + offsetZ, blk.key))
         }
+    }
     if (blocks.isEmpty()) {
         logger.warn("No chunk files loaded from ${folder.absolutePath}")
     }
@@ -237,6 +256,8 @@ fun main(args: Array<String>) {
 
     val dungeonFolder = resolveDungeonFolder(args)
     val dungeonFile = File(dungeonFolder, "dungeon.sml")
+    val worldSeed = resolveWorldSeed()
+    val debugChunks = isDebugEnabled(ENV_CHUNK_DEBUG)
     val dungeonText = if (dungeonFile.exists()) dungeonFile.readText() else "Dungeon { TileMap { lines: \"\" } }"
     val parseResult = parseDungeonBlocks(dungeonText)
     val chunkSize = parseResult.chunkSize ?: CHUNK_SIZE
@@ -247,6 +268,13 @@ fun main(args: Array<String>) {
     }
 
     val chunkCoords = collectChunkCoords(blocks, chunkSize)
+    logger.info("World seed: $worldSeed")
+    if (debugChunks) {
+        logger.info("Chunk load order (${chunkCoords.size} total):")
+        chunkCoords.forEachIndexed { index, coord ->
+            logger.info("chunk[$index] = (${coord.x},${coord.y},${coord.z})")
+        }
+    }
     embeddedServer(Netty, port = 8080) {
         install(CallLogging)
         routing {
