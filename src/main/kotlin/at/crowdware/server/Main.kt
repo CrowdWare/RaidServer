@@ -30,20 +30,31 @@ data class ChunkBlock(val x: Int, val y: Int, val z: Int, val tileId: Int)
 
 data class ChunkData(val header: ChunkHeader, val blocks: List<ChunkBlock>)
 
+data class ChunkCoord(val x: Int, val y: Int, val z: Int)
+
 private const val CHUNK_SIZE = 32
 private const val DEFAULT_BLOCK_CM = 60
 private val logger = LoggerFactory.getLogger("RaidServer")
 
-private fun parseDungeonBlocks(text: String): List<Block> {
+private data class DungeonParseResult(
+    val blocks: List<Block>,
+    val chunkSize: Int?
+)
+
+private fun parseDungeonBlocks(text: String, warnOnMissingLines: Boolean = true): DungeonParseResult {
     val blocks = mutableListOf<Block>()
     var currentLayer = 0
     var row = 0
 
     var linesText: String? = null
+    var chunkSize: Int? = null
     val handler = object : SmlHandler {
         override fun startElement(name: String) {}
 
         override fun onProperty(name: String, value: PropertyValue) {
+            if (name == "ChunkSize" && value is PropertyValue.IntValue) {
+                chunkSize = value.value
+            }
             if (name == "lines" && value is PropertyValue.StringValue) {
                 linesText = value.value
             }
@@ -56,8 +67,10 @@ private fun parseDungeonBlocks(text: String): List<Block> {
     parser.parse(handler)
 
     if (linesText.isNullOrBlank()) {
-        logger.warn("No TileMap lines block found in dungeon SML")
-        return blocks
+        if (warnOnMissingLines) {
+            logger.warn("No TileMap lines block found in dungeon SML")
+        }
+        return DungeonParseResult(blocks, chunkSize)
     }
 
     for (rawLine in linesText!!.lines()) {
@@ -79,7 +92,7 @@ private fun parseDungeonBlocks(text: String): List<Block> {
     }
 
     logger.info("Parsed ${blocks.size} blocks from dungeon SML")
-    return blocks
+    return DungeonParseResult(blocks, chunkSize)
 }
 
 private fun mapTileId(key: String): Int {
@@ -99,13 +112,13 @@ private fun mapTileId(key: String): Int {
     }
 }
 
-private fun chunkBlocks(blocks: List<Block>, chunkX: Int, chunkY: Int, chunkZ: Int): ChunkData {
-    val minX = chunkX * CHUNK_SIZE
-    val minY = chunkY * CHUNK_SIZE
-    val minZ = chunkZ * CHUNK_SIZE
-    val maxX = minX + CHUNK_SIZE - 1
-    val maxY = minY + CHUNK_SIZE - 1
-    val maxZ = minZ + CHUNK_SIZE - 1
+private fun chunkBlocks(blocks: List<Block>, chunkX: Int, chunkY: Int, chunkZ: Int, chunkSize: Int): ChunkData {
+    val minX = chunkX * chunkSize
+    val minY = chunkY * chunkSize
+    val minZ = chunkZ * chunkSize
+    val maxX = minX + chunkSize - 1
+    val maxY = minY + chunkSize - 1
+    val maxZ = minZ + chunkSize - 1
 
     val chunkBlocks = blocks.filter {
         it.x in minX..maxX && it.y in minY..maxY && it.z in minZ..maxZ
@@ -140,7 +153,62 @@ private fun encodeChunk(chunk: ChunkData): ByteArray {
     return buffer.array()
 }
 
-fun main() {
+private fun collectChunkCoords(blocks: List<Block>, chunkSize: Int): List<ChunkCoord> {
+    val coords = blocks.map {
+        ChunkCoord(
+            x = Math.floorDiv(it.x, chunkSize),
+            y = Math.floorDiv(it.y, chunkSize),
+            z = Math.floorDiv(it.z, chunkSize)
+        )
+    }.distinct().sortedWith(compareBy({ it.x }, { it.y }, { it.z }))
+    return coords
+}
+
+private fun resolveDungeonFolder(args: Array<String>): File {
+    val envFolder = System.getenv("DUNGEON_FOLDER")?.trim().orEmpty()
+    val argFolder = args.firstOrNull()?.trim().orEmpty()
+    val folder = when {
+        argFolder.isNotEmpty() -> argFolder
+        envFolder.isNotEmpty() -> envFolder
+        else -> "."
+    }
+    val file = File(folder)
+    if (!file.exists()) {
+        file.mkdirs()
+    }
+    return file
+}
+
+private fun parseChunkFileName(name: String): Triple<Int, Int, Int>? {
+    val regex = Regex("dungeon_(-?\\d+)_(-?\\d+)_(-?\\d+)\\.sml")
+    val match = regex.matchEntire(name) ?: return null
+    val (x, y, z) = match.destructured
+    return Triple(x.toInt(), y.toInt(), z.toInt())
+}
+
+private fun loadChunkedBlocks(folder: File, chunkSize: Int): List<Block> {
+    val blocks = mutableListOf<Block>()
+    if (!folder.exists()) return blocks
+    folder.listFiles { file -> file.isFile && file.name.startsWith("dungeon_") && file.name.endsWith(".sml") }
+        ?.forEach { file ->
+            val coords = parseChunkFileName(file.name) ?: return@forEach
+            val chunkText = file.readText()
+            val chunkParse = parseDungeonBlocks(chunkText, warnOnMissingLines = false)
+            val offsetX = coords.first * chunkSize
+            val offsetY = coords.second * chunkSize
+            val offsetZ = coords.third * chunkSize
+            chunkParse.blocks.forEach { blk ->
+                blocks.add(Block(blk.x + offsetX, blk.y + offsetY, blk.z + offsetZ, blk.key))
+            }
+        }
+    if (blocks.isEmpty()) {
+        logger.warn("No chunk files loaded from ${folder.absolutePath}")
+    }
+    logger.info("Loaded ${blocks.size} blocks from chunked dungeon files")
+    return blocks
+}
+
+fun main(args: Array<String>) {
     val smsEngine = ScriptEngine.withStandardLibrary()
     smsEngine.registerKotlinFunction("log") { args ->
         val msg = args.joinToString(" ") { it?.toString() ?: "null" }
@@ -167,18 +235,30 @@ fun main() {
         logger.error("SMS test failed", e)
     }
 
-    val dungeonFile = File("dungeon.sml")
+    val dungeonFolder = resolveDungeonFolder(args)
+    val dungeonFile = File(dungeonFolder, "dungeon.sml")
     val dungeonText = if (dungeonFile.exists()) dungeonFile.readText() else "Dungeon { TileMap { lines: \"\" } }"
-    val blocks = parseDungeonBlocks(dungeonText)
+    val parseResult = parseDungeonBlocks(dungeonText)
+    val chunkSize = parseResult.chunkSize ?: CHUNK_SIZE
+    val blocks = if (parseResult.chunkSize != null) {
+        loadChunkedBlocks(dungeonFolder, chunkSize)
+    } else {
+        parseResult.blocks
+    }
 
+    val chunkCoords = collectChunkCoords(blocks, chunkSize)
     embeddedServer(Netty, port = 8080) {
         install(CallLogging)
         routing {
+            get("/chunks") {
+                val payload = chunkCoords.joinToString(separator = "\n") { "${it.x},${it.y},${it.z}" }
+                call.respondText(payload, ContentType.Text.Plain)
+            }
             get("/chunk") {
                 val x = call.request.queryParameters["x"]?.toIntOrNull() ?: 0
                 val y = call.request.queryParameters["y"]?.toIntOrNull() ?: 0
                 val z = call.request.queryParameters["z"]?.toIntOrNull() ?: 0
-                val chunk = chunkBlocks(blocks, x, y, z)
+                val chunk = chunkBlocks(blocks, x, y, z, chunkSize)
                 logger.info("Serving chunk ($x,$y,$z) with ${chunk.blocks.size} blocks")
                 val payload = encodeChunk(chunk)
                 call.respondBytes(payload, contentType = ContentType.Application.OctetStream)
