@@ -26,8 +26,7 @@ cd sms
 
 ## Run Server
 ```sh
-cd Server
-./gradlew run
+./run_server.sh
 ```
 
 ## Dungeon Source
