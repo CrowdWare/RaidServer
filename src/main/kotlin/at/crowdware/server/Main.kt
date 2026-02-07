@@ -122,7 +122,7 @@ private fun mapTileId(key: String): Int {
         "x" -> 5
         "y" -> 6
         "z" -> 7
-        else -> 0
+        else -> if (key.length == 1) key[0].code else 0
     }
 }
 
@@ -278,6 +278,9 @@ fun main(args: Array<String>) {
     embeddedServer(Netty, port = 8080) {
         install(CallLogging)
         routing {
+            get("/dungeon") {
+                call.respondText(dungeonText, ContentType.Text.Plain)
+            }
             get("/chunks") {
                 val payload = chunkCoords.joinToString(separator = "\n") { "${it.x},${it.y},${it.z}" }
                 call.respondText(payload, ContentType.Text.Plain)
