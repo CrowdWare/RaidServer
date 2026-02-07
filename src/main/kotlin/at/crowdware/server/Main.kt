@@ -16,7 +16,7 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
-data class Block(val x: Int, val y: Int, val z: Int, val key: String)
+data class Block(val x: Int, val y: Int, val z: Int, val key: String, val scalePercent: Int = 100)
 
 data class ChunkHeader(
     val chunkX: Int,
@@ -26,7 +26,7 @@ data class ChunkHeader(
     val blockSizeCm: Int
 )
 
-data class ChunkBlock(val x: Int, val y: Int, val z: Int, val tileId: Int)
+data class ChunkBlock(val x: Int, val y: Int, val z: Int, val tileId: Int, val scalePercent: Int)
 
 data class ChunkData(val header: ChunkHeader, val blocks: List<ChunkBlock>)
 
@@ -37,11 +37,13 @@ private const val DEFAULT_BLOCK_CM = 60
 private const val DEFAULT_WORLD_SEED = 0L
 private const val ENV_WORLD_SEED = "WORLD_SEED"
 private const val ENV_CHUNK_DEBUG = "CHUNK_DEBUG"
+private const val ENV_SERVER_PORT = "SERVER_PORT"
 private val logger = LoggerFactory.getLogger("RaidServer")
 
 private data class DungeonParseResult(
     val blocks: List<Block>,
-    val chunkSize: Int?
+    val chunkSize: Int?,
+    val tileScaleByKey: Map<String, Int>
 )
 
 private fun resolveWorldSeed(): Long {
@@ -55,15 +57,33 @@ private fun isDebugEnabled(envName: String): Boolean {
     return value == "1" || value == "true" || value == "yes" || value == "on"
 }
 
+private fun resolveServerPort(): Int {
+    val env = System.getenv(ENV_SERVER_PORT)?.trim().orEmpty()
+    return env.toIntOrNull() ?: 8080
+}
+
 private fun parseDungeonBlocks(text: String, warnOnMissingLines: Boolean = true): DungeonParseResult {
     val blocks = mutableListOf<Block>()
     var currentLayer = 0
     var row = 0
+    val tileScaleByKey = mutableMapOf<String, Int>()
 
     var linesText: String? = null
     var chunkSize: Int? = null
     val handler = object : SmlHandler {
-        override fun startElement(name: String) {}
+        private val stack = mutableListOf<String>()
+        private var tileKey: String = ""
+        private var tileScalePercent: Int = 100
+        private var tileHasScale: Boolean = false
+
+        override fun startElement(name: String) {
+            stack.add(name)
+            if (name == "Tile") {
+                tileKey = ""
+                tileScalePercent = 100
+                tileHasScale = false
+            }
+        }
 
         override fun onProperty(name: String, value: PropertyValue) {
             if (name == "ChunkSize" && value is PropertyValue.IntValue) {
@@ -72,19 +92,41 @@ private fun parseDungeonBlocks(text: String, warnOnMissingLines: Boolean = true)
             if (name == "lines" && value is PropertyValue.StringValue) {
                 linesText = value.value
             }
+            if (stack.lastOrNull() == "Tile") {
+                if (name == "key" && value is PropertyValue.StringValue) {
+                    tileKey = value.value
+                } else if ((name == "scale_percent" || name == "scalePercent") && value is PropertyValue.IntValue) {
+                    tileScalePercent = value.value
+                    tileHasScale = true
+                }
+            }
         }
 
-        override fun endElement(name: String) {}
+        override fun endElement(name: String) {
+            if (name == "Tile" && tileKey.isNotBlank() && tileHasScale) {
+                tileScaleByKey[tileKey] = tileScalePercent.coerceAtLeast(1)
+            }
+            if (stack.isNotEmpty()) {
+                stack.removeAt(stack.lastIndex)
+            }
+        }
     }
 
-    val parser = SmlSaxParser(text)
+    // Compatibility: older/newer builder versions may write enum-like values
+    // without quotes (e.g. material: skinned). The shared Kotlin parser only
+    // accepts string/number/bool values, so we normalize those fields here.
+    val normalizedText = text
+        .replace(Regex("""(\bmaterial\s*:\s*)(texture|vertex|skinned)(\b)"""), "$1\"$2\"")
+        .replace(Regex("""(\bplacement\s*:\s*)(ground|wall|ceiling)(\b)"""), "$1\"$2\"")
+
+    val parser = SmlSaxParser(normalizedText)
     parser.parse(handler)
 
     if (linesText.isNullOrBlank()) {
         if (warnOnMissingLines) {
             logger.warn("No TileMap lines block found in dungeon SML")
         }
-        return DungeonParseResult(blocks, chunkSize)
+        return DungeonParseResult(blocks, chunkSize, tileScaleByKey)
     }
 
     for (rawLine in linesText!!.lines()) {
@@ -100,13 +142,14 @@ private fun parseDungeonBlocks(text: String, warnOnMissingLines: Boolean = true)
         for ((col, token) in tokens.withIndex()) {
             if (token == ".") continue
             val key = token.substringBefore(":")
-            blocks.add(Block(col, currentLayer, row, key))
+            val scalePercent = tileScaleByKey[key] ?: 100
+            blocks.add(Block(col, currentLayer, row, key, scalePercent))
         }
         row += 1
     }
 
     logger.info("Parsed ${blocks.size} blocks from dungeon SML")
-    return DungeonParseResult(blocks, chunkSize)
+    return DungeonParseResult(blocks, chunkSize, tileScaleByKey)
 }
 
 private fun mapTileId(key: String): Int {
@@ -141,7 +184,8 @@ private fun chunkBlocks(blocks: List<Block>, chunkX: Int, chunkY: Int, chunkZ: I
             x = it.x - minX,
             y = it.y - minY,
             z = it.z - minZ,
-            tileId = mapTileId(it.key)
+            tileId = mapTileId(it.key),
+            scalePercent = it.scalePercent.coerceIn(1, 255)
         )
     }
 
@@ -151,7 +195,7 @@ private fun chunkBlocks(blocks: List<Block>, chunkX: Int, chunkY: Int, chunkZ: I
 
 private fun encodeChunk(chunk: ChunkData): ByteArray {
     val header = chunk.header
-    val bufferSize = 16 + chunk.blocks.size * 4
+    val bufferSize = 16 + chunk.blocks.size * 5
     val buffer = ByteBuffer.allocate(bufferSize).order(ByteOrder.LITTLE_ENDIAN)
     buffer.putInt(header.chunkX)
     buffer.putInt(header.chunkY)
@@ -163,6 +207,7 @@ private fun encodeChunk(chunk: ChunkData): ByteArray {
         buffer.put(it.y.toByte())
         buffer.put(it.z.toByte())
         buffer.put(it.tileId.toByte())
+        buffer.put(it.scalePercent.toByte())
     }
     return buffer.array()
 }
@@ -200,7 +245,7 @@ private fun parseChunkFileName(name: String): Triple<Int, Int, Int>? {
     return Triple(x.toInt(), y.toInt(), z.toInt())
 }
 
-private fun loadChunkedBlocks(folder: File, chunkSize: Int): List<Block> {
+private fun loadChunkedBlocks(folder: File, chunkSize: Int, defaultTileScaleByKey: Map<String, Int>): List<Block> {
     val blocks = mutableListOf<Block>()
     if (!folder.exists()) return blocks
     val chunkFiles = folder.listFiles { file ->
@@ -217,7 +262,9 @@ private fun loadChunkedBlocks(folder: File, chunkSize: Int): List<Block> {
         val offsetY = coords.second * chunkSize
         val offsetZ = coords.third * chunkSize
         chunkParse.blocks.forEach { blk ->
-            blocks.add(Block(blk.x + offsetX, blk.y + offsetY, blk.z + offsetZ, blk.key))
+            val fallbackScale = defaultTileScaleByKey[blk.key] ?: 100
+            val effectiveScale = if (blk.scalePercent == 100) fallbackScale else blk.scalePercent
+            blocks.add(Block(blk.x + offsetX, blk.y + offsetY, blk.z + offsetZ, blk.key, effectiveScale))
         }
     }
     if (blocks.isEmpty()) {
@@ -257,12 +304,13 @@ fun main(args: Array<String>) {
     val dungeonFolder = resolveDungeonFolder(args)
     val dungeonFile = File(dungeonFolder, "dungeon.sml")
     val worldSeed = resolveWorldSeed()
+    val serverPort = resolveServerPort()
     val debugChunks = isDebugEnabled(ENV_CHUNK_DEBUG)
     val dungeonText = if (dungeonFile.exists()) dungeonFile.readText() else "Dungeon { TileMap { lines: \"\" } }"
     val parseResult = parseDungeonBlocks(dungeonText)
     val chunkSize = parseResult.chunkSize ?: CHUNK_SIZE
     val blocks = if (parseResult.chunkSize != null) {
-        loadChunkedBlocks(dungeonFolder, chunkSize)
+        loadChunkedBlocks(dungeonFolder, chunkSize, parseResult.tileScaleByKey)
     } else {
         parseResult.blocks
     }
@@ -275,7 +323,7 @@ fun main(args: Array<String>) {
             logger.info("chunk[$index] = (${coord.x},${coord.y},${coord.z})")
         }
     }
-    embeddedServer(Netty, port = 8080) {
+    embeddedServer(Netty, port = serverPort) {
         install(CallLogging)
         routing {
             get("/dungeon") {
